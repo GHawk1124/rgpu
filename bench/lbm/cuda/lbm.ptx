@@ -1,0 +1,402 @@
+// D3Q19 BGK fused stream and collide written by hand.
+// Same algorithm and kernel ABI as the Rust `step`: pull streaming with periodic wrap, SoA layout f[q * cells + n].
+// Uses two integer divisions, one reciprocal, the +c/-c symmetry of the equilibrium and read-only loads.
+
+.version 7.0
+.target sm_75
+.address_size 64
+
+.visible .entry step(
+	.param .u32 p_n,
+	.param .u64 p_src,
+	.param .u64 p_src_len,
+	.param .u64 p_dst,
+	.param .u64 p_dst_len,
+	.param .u32 p_nx,
+	.param .u32 p_ny,
+	.param .u32 p_nz,
+	.param .f32 p_omega
+)
+.maxntid 256, 1, 1
+{
+	.reg .pred out, edge;
+	.reg .u32 n, count, nx, ny, nz, nxy, cells, t, i;
+	.reg .u32 x, y, z, xp, xm, yp, ym, zp, zm, y0, yp0, ym0, z0, zp0, zm0;
+	.reg .u32 s<19>;
+	.reg .u64 src, dst, a;
+	.reg .f32 f<19>, rho, mx, my, mz, ir, ux, uy, uz, uu, base, omega, om1, rw0, rw1, rw2;
+	.reg .f32 cu, sym, anti, e;
+
+	mov.u32 n, %ctaid.x;
+	shl.b32 n, n, 8;
+	mov.u32 t, %tid.x;
+	add.u32 n, n, t;
+	ld.param.u32 count, [p_n];
+	setp.ge.u32 out, n, count;
+	@out bra done;
+
+	ld.param.u32 nx, [p_nx];
+	ld.param.u32 ny, [p_ny];
+	ld.param.u32 nz, [p_nz];
+	ld.param.f32 omega, [p_omega];
+	ld.param.u64 src, [p_src];
+	ld.param.u64 dst, [p_dst];
+	cvta.to.global.u64 src, src;
+	cvta.to.global.u64 dst, dst;
+	mul.lo.u32 nxy, nx, ny;
+	mul.lo.u32 cells, nxy, nz;
+
+	// x = n % nx, y = n / nx % ny, z = n / nx / ny
+	div.u32 t, n, nx;
+	mul.lo.u32 x, t, nx;
+	sub.u32 x, n, x;
+	div.u32 z, t, ny;
+	mul.lo.u32 y, z, ny;
+	sub.u32 y, t, y;
+
+	// Neighbours with periodic wrap.
+	add.u32 xp, x, 1;
+	setp.eq.u32 edge, xp, nx;
+	@edge mov.u32 xp, 0;
+	sub.u32 xm, x, 1;
+	setp.eq.u32 edge, x, 0;
+	@edge sub.u32 xm, nx, 1;
+	add.u32 yp, y, 1;
+	setp.eq.u32 edge, yp, ny;
+	@edge mov.u32 yp, 0;
+	sub.u32 ym, y, 1;
+	setp.eq.u32 edge, y, 0;
+	@edge sub.u32 ym, ny, 1;
+	add.u32 zp, z, 1;
+	setp.eq.u32 edge, zp, nz;
+	@edge mov.u32 zp, 0;
+	sub.u32 zm, z, 1;
+	setp.eq.u32 edge, z, 0;
+	@edge sub.u32 zm, nz, 1;
+
+	// Row and plane offsets of the source cells.
+	mul.lo.u32 y0, y, nx;
+	mul.lo.u32 yp0, yp, nx;
+	mul.lo.u32 ym0, ym, nx;
+	mul.lo.u32 z0, z, nxy;
+	mul.lo.u32 zp0, zp, nxy;
+	mul.lo.u32 zm0, zm, nxy;
+
+	// Velocity c pulls from x - c.
+	add.u32 t, y0, z0;
+	mov.u32 s0, n;
+	add.u32 s1, xm, t;            // ( 1,  0,  0)
+	add.u32 s2, xp, t;            // (-1,  0,  0)
+	add.u32 t, x, z0;
+	add.u32 s3, t, ym0;           // ( 0,  1,  0)
+	add.u32 s4, t, yp0;           // ( 0, -1,  0)
+	add.u32 t, x, y0;
+	add.u32 s5, t, zm0;           // ( 0,  0,  1)
+	add.u32 s6, t, zp0;           // ( 0,  0, -1)
+	add.u32 t, xm, z0;
+	add.u32 s7, t, ym0;           // ( 1,  1,  0)
+	add.u32 s13, t, yp0;          // ( 1, -1,  0)
+	add.u32 t, xp, z0;
+	add.u32 s8, t, yp0;           // (-1, -1,  0)
+	add.u32 s14, t, ym0;          // (-1,  1,  0)
+	add.u32 t, xm, y0;
+	add.u32 s9, t, zm0;           // ( 1,  0,  1)
+	add.u32 s15, t, zp0;          // ( 1,  0, -1)
+	add.u32 t, xp, y0;
+	add.u32 s10, t, zp0;          // (-1,  0, -1)
+	add.u32 s16, t, zm0;          // (-1,  0,  1)
+	add.u32 t, x, ym0;
+	add.u32 s11, t, zm0;          // ( 0,  1,  1)
+	add.u32 s17, t, zp0;          // ( 0,  1, -1)
+	add.u32 t, x, yp0;
+	add.u32 s12, t, zp0;          // ( 0, -1, -1)
+	add.u32 s18, t, zm0;          // ( 0, -1,  1)
+
+	// f[q] = src[q * cells + s[q]]
+	mad.wide.u32 a, s0, 4, src;
+	ld.global.nc.f32 f0, [a];
+	mad.lo.u32 i, cells, 1, s1;
+	mad.wide.u32 a, i, 4, src;
+	ld.global.nc.f32 f1, [a];
+	mad.lo.u32 i, cells, 2, s2;
+	mad.wide.u32 a, i, 4, src;
+	ld.global.nc.f32 f2, [a];
+	mad.lo.u32 i, cells, 3, s3;
+	mad.wide.u32 a, i, 4, src;
+	ld.global.nc.f32 f3, [a];
+	mad.lo.u32 i, cells, 4, s4;
+	mad.wide.u32 a, i, 4, src;
+	ld.global.nc.f32 f4, [a];
+	mad.lo.u32 i, cells, 5, s5;
+	mad.wide.u32 a, i, 4, src;
+	ld.global.nc.f32 f5, [a];
+	mad.lo.u32 i, cells, 6, s6;
+	mad.wide.u32 a, i, 4, src;
+	ld.global.nc.f32 f6, [a];
+	mad.lo.u32 i, cells, 7, s7;
+	mad.wide.u32 a, i, 4, src;
+	ld.global.nc.f32 f7, [a];
+	mad.lo.u32 i, cells, 8, s8;
+	mad.wide.u32 a, i, 4, src;
+	ld.global.nc.f32 f8, [a];
+	mad.lo.u32 i, cells, 9, s9;
+	mad.wide.u32 a, i, 4, src;
+	ld.global.nc.f32 f9, [a];
+	mad.lo.u32 i, cells, 10, s10;
+	mad.wide.u32 a, i, 4, src;
+	ld.global.nc.f32 f10, [a];
+	mad.lo.u32 i, cells, 11, s11;
+	mad.wide.u32 a, i, 4, src;
+	ld.global.nc.f32 f11, [a];
+	mad.lo.u32 i, cells, 12, s12;
+	mad.wide.u32 a, i, 4, src;
+	ld.global.nc.f32 f12, [a];
+	mad.lo.u32 i, cells, 13, s13;
+	mad.wide.u32 a, i, 4, src;
+	ld.global.nc.f32 f13, [a];
+	mad.lo.u32 i, cells, 14, s14;
+	mad.wide.u32 a, i, 4, src;
+	ld.global.nc.f32 f14, [a];
+	mad.lo.u32 i, cells, 15, s15;
+	mad.wide.u32 a, i, 4, src;
+	ld.global.nc.f32 f15, [a];
+	mad.lo.u32 i, cells, 16, s16;
+	mad.wide.u32 a, i, 4, src;
+	ld.global.nc.f32 f16, [a];
+	mad.lo.u32 i, cells, 17, s17;
+	mad.wide.u32 a, i, 4, src;
+	ld.global.nc.f32 f17, [a];
+	mad.lo.u32 i, cells, 18, s18;
+	mad.wide.u32 a, i, 4, src;
+	ld.global.nc.f32 f18, [a];
+
+	// Density and momentum.
+	add.f32 rho, f0, f1;
+	add.f32 rho, rho, f2;
+	add.f32 rho, rho, f3;
+	add.f32 rho, rho, f4;
+	add.f32 rho, rho, f5;
+	add.f32 rho, rho, f6;
+	add.f32 rho, rho, f7;
+	add.f32 rho, rho, f8;
+	add.f32 rho, rho, f9;
+	add.f32 rho, rho, f10;
+	add.f32 rho, rho, f11;
+	add.f32 rho, rho, f12;
+	add.f32 rho, rho, f13;
+	add.f32 rho, rho, f14;
+	add.f32 rho, rho, f15;
+	add.f32 rho, rho, f16;
+	add.f32 rho, rho, f17;
+	add.f32 rho, rho, f18;
+
+	sub.f32 mx, f1, f2;
+	add.f32 mx, mx, f7;
+	sub.f32 mx, mx, f8;
+	add.f32 mx, mx, f9;
+	sub.f32 mx, mx, f10;
+	add.f32 mx, mx, f13;
+	sub.f32 mx, mx, f14;
+	add.f32 mx, mx, f15;
+	sub.f32 mx, mx, f16;
+
+	sub.f32 my, f3, f4;
+	add.f32 my, my, f7;
+	sub.f32 my, my, f8;
+	add.f32 my, my, f11;
+	sub.f32 my, my, f12;
+	sub.f32 my, my, f13;
+	add.f32 my, my, f14;
+	add.f32 my, my, f17;
+	sub.f32 my, my, f18;
+
+	sub.f32 mz, f5, f6;
+	add.f32 mz, mz, f9;
+	sub.f32 mz, mz, f10;
+	add.f32 mz, mz, f11;
+	sub.f32 mz, mz, f12;
+	sub.f32 mz, mz, f15;
+	add.f32 mz, mz, f16;
+	sub.f32 mz, mz, f17;
+	add.f32 mz, mz, f18;
+
+	rcp.rn.f32 ir, rho;
+	mul.f32 ux, mx, ir;
+	mul.f32 uy, my, ir;
+	mul.f32 uz, mz, ir;
+
+	// feq = w rho (1 - 1.5 u.u + 3 c.u + 4.5 (c.u)^2), f' = (1 - omega) f + omega feq
+	mul.f32 uu, ux, ux;
+	fma.rn.f32 uu, uy, uy, uu;
+	fma.rn.f32 uu, uz, uz, uu;
+	fma.rn.f32 base, uu, 0fBFC00000, 0f3F800000;     // 1 - 1.5 uu
+	mov.f32 om1, 0f3F800000;
+	sub.f32 om1, om1, omega;
+	mul.f32 rw0, omega, rho;
+	mul.f32 rw1, rw0, 0f3D638E39;                     // 1/18
+	mul.f32 rw2, rw0, 0f3CE38E39;                     // 1/36
+	mul.f32 rw0, rw0, 0f3EAAAAAB;                     // 1/3
+
+	mul.f32 e, rw0, base;
+	fma.rn.f32 f0, om1, f0, e;
+
+	mov.f32 cu, ux;
+	mul.f32 sym, cu, 0f40900000;                      // 4.5 cu
+	fma.rn.f32 sym, sym, cu, base;
+	mul.f32 anti, cu, 0f40400000;                     // 3 cu
+	add.f32 e, sym, anti;
+	mul.f32 e, e, rw1;
+	fma.rn.f32 f1, om1, f1, e;
+	sub.f32 e, sym, anti;
+	mul.f32 e, e, rw1;
+	fma.rn.f32 f2, om1, f2, e;
+
+	mov.f32 cu, uy;
+	mul.f32 sym, cu, 0f40900000;
+	fma.rn.f32 sym, sym, cu, base;
+	mul.f32 anti, cu, 0f40400000;
+	add.f32 e, sym, anti;
+	mul.f32 e, e, rw1;
+	fma.rn.f32 f3, om1, f3, e;
+	sub.f32 e, sym, anti;
+	mul.f32 e, e, rw1;
+	fma.rn.f32 f4, om1, f4, e;
+
+	mov.f32 cu, uz;
+	mul.f32 sym, cu, 0f40900000;
+	fma.rn.f32 sym, sym, cu, base;
+	mul.f32 anti, cu, 0f40400000;
+	add.f32 e, sym, anti;
+	mul.f32 e, e, rw1;
+	fma.rn.f32 f5, om1, f5, e;
+	sub.f32 e, sym, anti;
+	mul.f32 e, e, rw1;
+	fma.rn.f32 f6, om1, f6, e;
+
+	add.f32 cu, ux, uy;
+	mul.f32 sym, cu, 0f40900000;
+	fma.rn.f32 sym, sym, cu, base;
+	mul.f32 anti, cu, 0f40400000;
+	add.f32 e, sym, anti;
+	mul.f32 e, e, rw2;
+	fma.rn.f32 f7, om1, f7, e;
+	sub.f32 e, sym, anti;
+	mul.f32 e, e, rw2;
+	fma.rn.f32 f8, om1, f8, e;
+
+	add.f32 cu, ux, uz;
+	mul.f32 sym, cu, 0f40900000;
+	fma.rn.f32 sym, sym, cu, base;
+	mul.f32 anti, cu, 0f40400000;
+	add.f32 e, sym, anti;
+	mul.f32 e, e, rw2;
+	fma.rn.f32 f9, om1, f9, e;
+	sub.f32 e, sym, anti;
+	mul.f32 e, e, rw2;
+	fma.rn.f32 f10, om1, f10, e;
+
+	add.f32 cu, uy, uz;
+	mul.f32 sym, cu, 0f40900000;
+	fma.rn.f32 sym, sym, cu, base;
+	mul.f32 anti, cu, 0f40400000;
+	add.f32 e, sym, anti;
+	mul.f32 e, e, rw2;
+	fma.rn.f32 f11, om1, f11, e;
+	sub.f32 e, sym, anti;
+	mul.f32 e, e, rw2;
+	fma.rn.f32 f12, om1, f12, e;
+
+	sub.f32 cu, ux, uy;
+	mul.f32 sym, cu, 0f40900000;
+	fma.rn.f32 sym, sym, cu, base;
+	mul.f32 anti, cu, 0f40400000;
+	add.f32 e, sym, anti;
+	mul.f32 e, e, rw2;
+	fma.rn.f32 f13, om1, f13, e;
+	sub.f32 e, sym, anti;
+	mul.f32 e, e, rw2;
+	fma.rn.f32 f14, om1, f14, e;
+
+	sub.f32 cu, ux, uz;
+	mul.f32 sym, cu, 0f40900000;
+	fma.rn.f32 sym, sym, cu, base;
+	mul.f32 anti, cu, 0f40400000;
+	add.f32 e, sym, anti;
+	mul.f32 e, e, rw2;
+	fma.rn.f32 f15, om1, f15, e;
+	sub.f32 e, sym, anti;
+	mul.f32 e, e, rw2;
+	fma.rn.f32 f16, om1, f16, e;
+
+	sub.f32 cu, uy, uz;
+	mul.f32 sym, cu, 0f40900000;
+	fma.rn.f32 sym, sym, cu, base;
+	mul.f32 anti, cu, 0f40400000;
+	add.f32 e, sym, anti;
+	mul.f32 e, e, rw2;
+	fma.rn.f32 f17, om1, f17, e;
+	sub.f32 e, sym, anti;
+	mul.f32 e, e, rw2;
+	fma.rn.f32 f18, om1, f18, e;
+
+	// dst[q * cells + n] = f'[q]
+	mad.wide.u32 a, n, 4, dst;
+	st.global.f32 [a], f0;
+	mad.lo.u32 i, cells, 1, n;
+	mad.wide.u32 a, i, 4, dst;
+	st.global.f32 [a], f1;
+	mad.lo.u32 i, cells, 2, n;
+	mad.wide.u32 a, i, 4, dst;
+	st.global.f32 [a], f2;
+	mad.lo.u32 i, cells, 3, n;
+	mad.wide.u32 a, i, 4, dst;
+	st.global.f32 [a], f3;
+	mad.lo.u32 i, cells, 4, n;
+	mad.wide.u32 a, i, 4, dst;
+	st.global.f32 [a], f4;
+	mad.lo.u32 i, cells, 5, n;
+	mad.wide.u32 a, i, 4, dst;
+	st.global.f32 [a], f5;
+	mad.lo.u32 i, cells, 6, n;
+	mad.wide.u32 a, i, 4, dst;
+	st.global.f32 [a], f6;
+	mad.lo.u32 i, cells, 7, n;
+	mad.wide.u32 a, i, 4, dst;
+	st.global.f32 [a], f7;
+	mad.lo.u32 i, cells, 8, n;
+	mad.wide.u32 a, i, 4, dst;
+	st.global.f32 [a], f8;
+	mad.lo.u32 i, cells, 9, n;
+	mad.wide.u32 a, i, 4, dst;
+	st.global.f32 [a], f9;
+	mad.lo.u32 i, cells, 10, n;
+	mad.wide.u32 a, i, 4, dst;
+	st.global.f32 [a], f10;
+	mad.lo.u32 i, cells, 11, n;
+	mad.wide.u32 a, i, 4, dst;
+	st.global.f32 [a], f11;
+	mad.lo.u32 i, cells, 12, n;
+	mad.wide.u32 a, i, 4, dst;
+	st.global.f32 [a], f12;
+	mad.lo.u32 i, cells, 13, n;
+	mad.wide.u32 a, i, 4, dst;
+	st.global.f32 [a], f13;
+	mad.lo.u32 i, cells, 14, n;
+	mad.wide.u32 a, i, 4, dst;
+	st.global.f32 [a], f14;
+	mad.lo.u32 i, cells, 15, n;
+	mad.wide.u32 a, i, 4, dst;
+	st.global.f32 [a], f15;
+	mad.lo.u32 i, cells, 16, n;
+	mad.wide.u32 a, i, 4, dst;
+	st.global.f32 [a], f16;
+	mad.lo.u32 i, cells, 17, n;
+	mad.wide.u32 a, i, 4, dst;
+	st.global.f32 [a], f17;
+	mad.lo.u32 i, cells, 18, n;
+	mad.wide.u32 a, i, 4, dst;
+	st.global.f32 [a], f18;
+
+done:
+	ret;
+}

@@ -1,0 +1,26 @@
+[package]
+name = "rgpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rgpu-macros = { path = "../rgpu-macros" }
+
+[features]
+# cuda-oxide device support, only needed by kernel crates built with `oxide: true`.
+oxide = ["dep:cuda-device"]
+
+[target.'cfg(not(rgpu))'.dependencies]
+ash = "0.38"
+libloading = "0.9"
+rayon = "1.12"
+
+[target.'cfg(rgpu = "spirv")'.dependencies]
+spirv-std = "=0.10.0"
+
+[target.'cfg(rgpu = "oxide")'.dependencies]
+cuda-device = { git = "https://github.com/NVIDIA/cuda-rust", rev = "a0cc6cc0bc18722ec5cdfbea136c118a7c051977", optional = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(rgpu, values(none(), "ptx", "nvvm", "oxide", "spirv", "amdgpu"))'] }

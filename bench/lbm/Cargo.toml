@@ -1,0 +1,12 @@
+[package]
+name = "lbm"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+rgpu = { path = "../../rgpu" }
+lbm-kernels = { path = "kernels" }
+
+[build-dependencies]
+cc = "1"

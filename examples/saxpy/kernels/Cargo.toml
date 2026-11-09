@@ -1,0 +1,11 @@
+[package]
+name = "saxpy-kernels"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+rgpu = { path = "../../../rgpu" }
+
+[build-dependencies]
+rgpu-build = { path = "../../../rgpu-build" }

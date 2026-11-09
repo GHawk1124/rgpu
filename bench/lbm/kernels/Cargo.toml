@@ -1,0 +1,11 @@
+[package]
+name = "lbm-kernels"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+rgpu = { path = "../../../rgpu", features = ["oxide"] }
+
+[build-dependencies]
+rgpu-build = { path = "../../../rgpu-build" }

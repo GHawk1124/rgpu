@@ -1,0 +1,10 @@
+[workspace]
+resolver = "3"
+members = ["rgpu", "rgpu-macros", "rgpu-build", "examples/saxpy", "examples/saxpy/kernels", "bench/lbm", "bench/lbm/kernels"]
+# lbm needs nvcc, so plain `cargo build` and `cargo test` leave it out.
+default-members = ["rgpu", "rgpu-macros", "rgpu-build", "examples/saxpy", "examples/saxpy/kernels"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
